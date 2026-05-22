@@ -166,6 +166,16 @@ async def fetch_page(
         resp = await client.get(
             f"{base_url}/", params=fallback_params, follow_redirects=False
         )
+        # フォールバックも 301/302 を返すサイトがあるので 1段だけ追跡
+        if 300 <= resp.status_code < 400:
+            loc = resp.headers.get("location")
+            if loc:
+                # 相対URLなら base_url で補完
+                if loc.startswith("/"):
+                    from urllib.parse import urlparse
+                    p = urlparse(base_url)
+                    loc = f"{p.scheme}://{p.netloc}{loc}"
+                resp = await client.get(loc, follow_redirects=False)
 
     # 範囲外ページは 400 → 空として終端扱い
     if resp.status_code == 400:
@@ -488,11 +498,31 @@ async def crawl_all(only_site_ids: list[str] | None = None) -> dict[str, int]:
     if only_site_ids:
         sites = [s for s in sites if s["id"] in only_site_ids]
 
+    # WAF/CDN ブロック回避のため、ブラウザ風 User-Agent を送る
+    _browser_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/html;q=0.9, */*;q=0.8",
+        "Accept-Language": "ja,en-US;q=0.7,en;q=0.3",
+    }
+
+    # 旧式SSL (DH_KEY_TOO_SMALL 等) サイト対応: SECLEVEL を 1 に下げる
+    import ssl as _ssl
+    ssl_ctx = _ssl.create_default_context()
+    try:
+        ssl_ctx.set_ciphers("DEFAULT@SECLEVEL=1")
+    except _ssl.SSLError:
+        pass
+
     results: dict[str, int] = {}
     async with httpx.AsyncClient(
         timeout=timeout,
-        headers={"User-Agent": "wp-multi-search/0.1"},
+        headers=_browser_headers,
         follow_redirects=True,
+        verify=ssl_ctx,
     ) as client:
         # サイトごとに並列実行 (ただし同時実行数は抑える)
         sem = asyncio.Semaphore(5)
