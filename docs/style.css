@@ -153,11 +153,6 @@ mark { background: var(--highlight); padding: 0 1px; }
     padding: 6px 14px; border-radius: var(--radius); cursor: pointer;
     font-size: 13px; border: 1px solid var(--border);
     background: var(--surface);
-    /* aタグでも button と同じ見た目に */
-    text-decoration: none;
-    display: inline-flex;
-    align-items: center;
-    color: var(--text);
 }
 .btn:hover:not(:disabled) { background: var(--accent-bg); }
 .btn-secondary { color: var(--text); }
