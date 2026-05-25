@@ -492,7 +492,11 @@ def _extract_article(html: str) -> tuple[str, str, str | None, str | None]:
 
 
 async def crawl_site_scrape(
-    client: httpx.AsyncClient, site: dict, crawl_cfg: dict
+    client: httpx.AsyncClient,
+    site: dict,
+    crawl_cfg: dict,
+    *,
+    purge_stale: bool = False,
 ) -> int:
     """HTMLアーカイブから記事URLを抽出して個別にfetchするモード。
 
@@ -500,6 +504,10 @@ async def crawl_site_scrape(
       scrape:
         archive_url: https://example.com/category/foo/
         link_re: "^https://example\\.com/post-[a-z0-9-]+/?$"
+
+    purge_stale=True の場合:
+      - アーカイブに載っていない記事を DB から削除
+      - 安全策: 削除予定が DB の50%を超える場合は中止 (アーカイブ取得失敗を疑う)
     """
     site_id = site["id"]
     base_url = site["url"].rstrip("/")
@@ -510,7 +518,7 @@ async def crawl_site_scrape(
     link_re = re.compile(cfg["link_re"])
     delay = crawl_cfg.get("delay_between_requests", 0.5)
 
-    log.info(f"[{site_id}] scrape start archive={archive_url}")
+    log.info(f"[{site_id}] scrape start archive={archive_url} purge_stale={purge_stale}")
 
     # アーカイブ取得 → リンク抽出
     resp = await client.get(archive_url)
@@ -526,7 +534,12 @@ async def crawl_site_scrape(
 
     count = 0
     newest_modified = None
+    fetched_ids: set[int] = set()
+    fetch_errors = 0
     for url in article_urls:
+        # アーカイブに載った URL は (取得成否に関係なく) 「存在する記事」
+        # として post_id を集めておく → 削除対象から除外
+        fetched_ids.add(_url_to_post_id(url))
         try:
             r = await client.get(url)
             r.raise_for_status()
@@ -559,12 +572,30 @@ async def crawl_site_scrape(
             )
         except httpx.HTTPError as e:
             log.warning(f"[{site_id}] scrape failed for {url}: {e}")
+            fetch_errors += 1
         await asyncio.sleep(delay)
 
     db.update_site_crawl_state(
         site_id, datetime.now(timezone.utc).isoformat(), newest_modified
     )
-    log.info(f"[{site_id}] scrape done: {count} articles")
+    log.info(f"[{site_id}] scrape done: {count} articles ({fetch_errors} errors)")
+
+    # purge_stale: アーカイブに無い旧記事を削除
+    if purge_stale and article_urls:
+        db_ids = db.get_post_ids_for_site(site_id)
+        stale_ids = list(db_ids - fetched_ids)
+        if not stale_ids:
+            log.info(f"[{site_id}] no stale posts")
+        elif len(db_ids) > 0 and len(stale_ids) / len(db_ids) > 0.5:
+            # 50%超を消そうとしてる時点で異常 (アーカイブ壊れた可能性)
+            log.warning(
+                f"[{site_id}] purge skipped: would delete {len(stale_ids)}/{len(db_ids)} "
+                f"(>50%). アーカイブが壊れている可能性"
+            )
+        else:
+            deleted = db.delete_posts(site_id, stale_ids)
+            log.info(f"[{site_id}] purged {deleted} stale posts")
+
     return count
 
 
@@ -628,8 +659,9 @@ async def crawl_all(
             async with sem:
                 try:
                     if site.get("scrape"):
-                        # スクレイピング経路は purge 非対応 (削除検知は次回検討)
-                        n = await crawl_site_scrape(client, site, crawl_cfg)
+                        n = await crawl_site_scrape(
+                            client, site, crawl_cfg, purge_stale=purge_stale
+                        )
                     else:
                         n = await crawl_site(
                             client, site, crawl_cfg, purge_stale=purge_stale
