@@ -363,22 +363,16 @@ async def crawl_site(
                 )
             log.info(f"[{site_id}] done: {count} posts (server reports {server_total})")
 
-            # purge_stale 成功時: 取得できなかった post を削除
-            # 安全策: 全件取得 (last_modified is None) かつ server_total と一致したときのみ
+            # purge_stale 成功時: 取得できなかった post を削除 (安全装置なし)
+            # 全件取得 (last_modified is None) のときのみ
             if purge_stale and last_modified is None:
-                if server_total and count >= server_total:
-                    db_ids = db.get_post_ids_for_site(site_id)
-                    stale_ids = list(db_ids - fetched_ids)
-                    if stale_ids:
-                        deleted = db.delete_posts(site_id, stale_ids)
-                        log.info(f"[{site_id}] purged {deleted} stale posts")
-                    else:
-                        log.info(f"[{site_id}] no stale posts")
+                db_ids = db.get_post_ids_for_site(site_id)
+                stale_ids = list(db_ids - fetched_ids)
+                if stale_ids:
+                    deleted = db.delete_posts(site_id, stale_ids)
+                    log.info(f"[{site_id}] purged {deleted} stale posts")
                 else:
-                    log.warning(
-                        f"[{site_id}] purge skipped: incomplete fetch "
-                        f"({count}/{server_total})"
-                    )
+                    log.info(f"[{site_id}] no stale posts")
             return count
         except TIMEOUT_EXC as e:
             log.warning(
@@ -580,21 +574,15 @@ async def crawl_site_scrape(
     )
     log.info(f"[{site_id}] scrape done: {count} articles ({fetch_errors} errors)")
 
-    # purge_stale: アーカイブに無い旧記事を削除
-    if purge_stale and article_urls:
+    # purge_stale: アーカイブに無い旧記事を削除 (安全装置なし、消してもDBだけ)
+    if purge_stale:
         db_ids = db.get_post_ids_for_site(site_id)
         stale_ids = list(db_ids - fetched_ids)
-        if not stale_ids:
-            log.info(f"[{site_id}] no stale posts")
-        elif len(db_ids) > 0 and len(stale_ids) / len(db_ids) > 0.5:
-            # 50%超を消そうとしてる時点で異常 (アーカイブ壊れた可能性)
-            log.warning(
-                f"[{site_id}] purge skipped: would delete {len(stale_ids)}/{len(db_ids)} "
-                f"(>50%). アーカイブが壊れている可能性"
-            )
-        else:
+        if stale_ids:
             deleted = db.delete_posts(site_id, stale_ids)
             log.info(f"[{site_id}] purged {deleted} stale posts")
+        else:
+            log.info(f"[{site_id}] no stale posts")
 
     return count
 
