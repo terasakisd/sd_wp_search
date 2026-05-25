@@ -1,33 +1,55 @@
-"""Supabase版 DB 層。既存の db.py と同じインタフェースを提供する。
+"""Supabase版 DB 層 (PostgREST 直接呼び出し版)。
 
-GitHub Actions などからクローラを動かすときに、SQLite ではなく Supabase に
-書き込むために使う。FastAPI 側の検索ロジックは Supabase RPC を直接呼ぶので
-このモジュールは書き込み専用。
+supabase-py を使わず httpx で直接 REST API を叩く。理由:
+- 新形式キー (sb_secret_*) も旧形式 JWT も両方そのまま使える
+- 依存が少なく、Python 3.9 でもビルド問題なし
 
 環境変数:
     SUPABASE_URL          - https://xxxxx.supabase.co
-    SUPABASE_SERVICE_KEY  - service_role の secret key (書き込み権限あり)
+    SUPABASE_SERVICE_KEY  - service_role key (旧JWT も新 sb_secret_ も可)
 """
 from __future__ import annotations
 
 import os
-import re
 import unicodedata
 from typing import Any
 
-from supabase import Client, create_client
+import httpx
 
 
-_SB: Client | None = None
+_SUPABASE_URL = ""
+_HEADERS: dict[str, str] = {}
 
 
-def _client() -> Client:
-    global _SB
-    if _SB is None:
-        url = os.environ["SUPABASE_URL"]
-        key = os.environ["SUPABASE_SERVICE_KEY"]
-        _SB = create_client(url, key)
-    return _SB
+def _init_client() -> None:
+    """環境変数から URL と認証ヘッダを構築。"""
+    global _SUPABASE_URL, _HEADERS
+    if _HEADERS:
+        return
+    url = os.environ["SUPABASE_URL"].rstrip("/")
+    key = os.environ["SUPABASE_SERVICE_KEY"]
+    _SUPABASE_URL = url
+    _HEADERS = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+
+
+def _rest(method: str, path: str, *, params: dict | None = None,
+          json: Any = None, extra_headers: dict | None = None) -> httpx.Response:
+    _init_client()
+    headers = dict(_HEADERS)
+    if extra_headers:
+        headers.update(extra_headers)
+    url = f"{_SUPABASE_URL}/rest/v1{path}"
+    with httpx.Client(timeout=30) as c:
+        r = c.request(method, url, params=params, json=json, headers=headers)
+    if r.status_code >= 400:
+        raise RuntimeError(
+            f"Supabase REST error: {r.status_code} {r.text[:300]}"
+        )
+    return r
 
 
 # ----- トークン化 (db.py から移植) ------------------------------------------
@@ -88,10 +110,13 @@ def init_db() -> None:
 # ----- サイト操作 -----------------------------------------------------------
 
 def upsert_site(site_id: str, name: str, url: str, group_id: str = "backlink") -> None:
-    _client().table("sites").upsert(
-        {"id": site_id, "name": name, "url": url, "group_id": group_id},
-        on_conflict="id",
-    ).execute()
+    _rest(
+        "POST",
+        "/sites",
+        params={"on_conflict": "id"},
+        json={"id": site_id, "name": name, "url": url, "group_id": group_id},
+        extra_headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+    )
 
 
 def update_site_crawl_state(
@@ -100,28 +125,44 @@ def update_site_crawl_state(
     payload: dict[str, Any] = {"last_crawled_at": last_crawled_at}
     if last_modified is not None:
         payload["last_modified"] = last_modified
-    _client().table("sites").update(payload).eq("id", site_id).execute()
+    _rest(
+        "PATCH",
+        "/sites",
+        params={"id": f"eq.{site_id}"},
+        json=payload,
+        extra_headers={"Prefer": "return=minimal"},
+    )
 
 
 def get_site(site_id: str) -> dict | None:
-    res = (
-        _client().table("sites").select("*").eq("id", site_id).limit(1).execute()
-    )
-    return res.data[0] if res.data else None
+    r = _rest("GET", "/sites", params={"id": f"eq.{site_id}", "limit": 1})
+    data = r.json()
+    return data[0] if data else None
 
 
 def list_sites() -> list[dict]:
-    res = _client().table("sites").select("*").order("name").execute()
-    return res.data or []
+    r = _rest("GET", "/sites", params={"order": "name.asc"})
+    return r.json() or []
 
 
 def reset_site_modified_state(site_id: str) -> None:
-    _client().table("sites").update({"last_modified": None}).eq("id", site_id).execute()
+    _rest(
+        "PATCH",
+        "/sites",
+        params={"id": f"eq.{site_id}"},
+        json={"last_modified": None},
+        extra_headers={"Prefer": "return=minimal"},
+    )
 
 
 def reset_all_modified_state() -> None:
-    # PostgREST は全件 UPDATE に WHERE 条件を要求するので、ありえない条件で全件指定
-    _client().table("sites").update({"last_modified": None}).not_.is_("id", None).execute()
+    _rest(
+        "PATCH",
+        "/sites",
+        params={"id": "neq.__never__"},
+        json={"last_modified": None},
+        extra_headers={"Prefer": "return=minimal"},
+    )
 
 
 # ----- 記事操作 -------------------------------------------------------------
@@ -144,21 +185,36 @@ def upsert_post(post: dict[str, Any]) -> None:
     if not p.get("tags"):
         p["tags"] = None
 
-    _client().table("posts").upsert(p, on_conflict="site_id,post_id").execute()
+    _rest(
+        "POST",
+        "/posts",
+        params={"on_conflict": "site_id,post_id"},
+        json=p,
+        extra_headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+    )
 
 
 # ----- 件数取得 (動作確認用) ------------------------------------------------
 
 def count_posts() -> int:
-    res = _client().table("posts").select("id", count="exact").limit(1).execute()
-    return res.count or 0
+    r = _rest(
+        "GET", "/posts", params={"select": "id", "limit": 1},
+        extra_headers={"Prefer": "count=exact"},
+    )
+    cr = r.headers.get("content-range", "")
+    # content-range: "0-0/12345"
+    if "/" in cr:
+        try:
+            return int(cr.split("/")[-1])
+        except ValueError:
+            return 0
+    return 0
 
 
 def count_posts_by_site() -> dict[str, int]:
-    # PostgreSQL の group by は RPC 経由が便利だが、ここでは簡易実装
-    res = _client().table("posts").select("site_id").execute()
+    r = _rest("GET", "/posts", params={"select": "site_id"})
     counts: dict[str, int] = {}
-    for row in res.data or []:
+    for row in r.json() or []:
         sid = row["site_id"]
         counts[sid] = counts.get(sid, 0) + 1
     return counts
