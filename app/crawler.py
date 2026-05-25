@@ -248,17 +248,18 @@ async def _walk_all_pages(
     delay: float,
     rest_base: str = "posts",
     extra_params: dict | None = None,
-) -> tuple[int, str | None, int]:
+) -> tuple[int, str | None, int, set[int]]:
     """指定モードで全ページを1回最後まで走る。
 
     タイムアウト等で途中失敗した場合は例外を上位に伝播させ、
     上位がより弱いモードで page=1 から再走できるようにする。
-    返り値: (取得件数, 最新 modified, サーバ側の総件数)
+    返り値: (取得件数, 最新 modified, サーバ側の総件数, 取得した post_id 集合)
     """
     count = 0
     page = 1
     newest_modified = modified_after
     server_total = 0
+    fetched_ids: set[int] = set()
     while True:
         posts, total_pages, server_total = await fetch_page(
             client, base_url,
@@ -273,6 +274,12 @@ async def _walk_all_pages(
             normalized = normalize_post(site_id, post, base_url=base_url)
             db.upsert_post(normalized)
             count += 1
+            pid = normalized.get("post_id")
+            if pid is not None:
+                try:
+                    fetched_ids.add(int(pid))
+                except (ValueError, TypeError):
+                    pass
             mod = normalized.get("modified_at")
             if mod and (newest_modified is None or mod > newest_modified):
                 newest_modified = mod
@@ -286,21 +293,32 @@ async def _walk_all_pages(
         page += 1
         await asyncio.sleep(delay)
 
-    return count, newest_modified, server_total
+    return count, newest_modified, server_total, fetched_ids
 
 
-async def crawl_site(client: httpx.AsyncClient, site: dict, crawl_cfg: dict) -> int:
+async def crawl_site(
+    client: httpx.AsyncClient,
+    site: dict,
+    crawl_cfg: dict,
+    *,
+    purge_stale: bool = False,
+) -> int:
     """1サイトをクロール。新規追加 + 更新された件数を返す。
 
     リトライ戦略: 各モードは page=1 から最後まで完走する。途中で例外なら
     モードを弱めて最初からやり直す (upsert は冪等なので重複は問題ない)。
+
+    purge_stale=True の場合:
+      - modified_after を無視して全件取得
+      - 成功時、DB にあって取得結果に含まれなかった post を削除
     """
     site_id = site["id"]
     base_url = site["url"].rstrip("/")
     db.upsert_site(site_id, site["name"], base_url, site.get("group") or "backlink")
 
     state = db.get_site(site_id)
-    last_modified = state["last_modified"] if state else None
+    # purge_stale 時は強制全件 (modified_after を無視)
+    last_modified = None if purge_stale else (state["last_modified"] if state else None)
 
     default_pp = int(crawl_cfg.get("per_page", 100))
     delay = crawl_cfg.get("delay_between_requests", 0.5)
@@ -310,7 +328,7 @@ async def crawl_site(client: httpx.AsyncClient, site: dict, crawl_cfg: dict) -> 
 
     log.info(
         f"[{site_id}] start (since={last_modified or 'all'}) "
-        f"rest_base={rest_base} extra={extra_params}"
+        f"rest_base={rest_base} extra={extra_params} purge_stale={purge_stale}"
     )
 
     # 試行モード: リッチ → 軽量 → さらに小さく
@@ -326,7 +344,7 @@ async def crawl_site(client: httpx.AsyncClient, site: dict, crawl_cfg: dict) -> 
             log.info(
                 f"[{site_id}] attempt embed={attempt['embed']} per_page={attempt['per_page']}"
             )
-            count, newest, server_total = await _walk_all_pages(
+            count, newest, server_total, fetched_ids = await _walk_all_pages(
                 client, site_id, base_url,
                 per_page=attempt["per_page"],
                 embed=attempt["embed"],
@@ -344,6 +362,23 @@ async def crawl_site(client: httpx.AsyncClient, site: dict, crawl_cfg: dict) -> 
                     f"(差分クロール時は X-WP-Total と一致しない場合あり)"
                 )
             log.info(f"[{site_id}] done: {count} posts (server reports {server_total})")
+
+            # purge_stale 成功時: 取得できなかった post を削除
+            # 安全策: 全件取得 (last_modified is None) かつ server_total と一致したときのみ
+            if purge_stale and last_modified is None:
+                if server_total and count >= server_total:
+                    db_ids = db.get_post_ids_for_site(site_id)
+                    stale_ids = list(db_ids - fetched_ids)
+                    if stale_ids:
+                        deleted = db.delete_posts(site_id, stale_ids)
+                        log.info(f"[{site_id}] purged {deleted} stale posts")
+                    else:
+                        log.info(f"[{site_id}] no stale posts")
+                else:
+                    log.warning(
+                        f"[{site_id}] purge skipped: incomplete fetch "
+                        f"({count}/{server_total})"
+                    )
             return count
         except TIMEOUT_EXC as e:
             log.warning(
@@ -533,8 +568,15 @@ async def crawl_site_scrape(
     return count
 
 
-async def crawl_all(only_site_ids: list[str] | None = None) -> dict[str, int]:
-    """設定ファイル上の全サイトをクロール。"""
+async def crawl_all(
+    only_site_ids: list[str] | None = None,
+    *,
+    purge_stale: bool = False,
+) -> dict[str, int]:
+    """設定ファイル上の全サイトをクロール。
+
+    purge_stale=True: 全件取得し直し、DBから削除済み記事を消す。
+    """
     config = load_config()
     crawl_cfg = config.get("crawl", {})
     timeout = crawl_cfg.get("request_timeout", 30)
@@ -586,9 +628,12 @@ async def crawl_all(only_site_ids: list[str] | None = None) -> dict[str, int]:
             async with sem:
                 try:
                     if site.get("scrape"):
+                        # スクレイピング経路は purge 非対応 (削除検知は次回検討)
                         n = await crawl_site_scrape(client, site, crawl_cfg)
                     else:
-                        n = await crawl_site(client, site, crawl_cfg)
+                        n = await crawl_site(
+                            client, site, crawl_cfg, purge_stale=purge_stale
+                        )
                     results[site["id"]] = n
                 except Exception as e:
                     log.exception(f"[{site['id']}] failed: {e}")
@@ -605,10 +650,14 @@ def main() -> None:
     # (カンマ区切り、空白可。空なら全件)
     only_env = os.getenv("CRAWL_ONLY_SITE_IDS", "").strip()
     only_ids = [s.strip() for s in only_env.split(",") if s.strip()] or None
+    # CRAWL_PURGE_STALE=1 で削除検知モード (全件取得 + 取れなかった記事をDBから削除)
+    purge_stale = os.getenv("CRAWL_PURGE_STALE", "").strip() in ("1", "true", "True")
     if only_ids:
         log.info(f"crawl restricted to {len(only_ids)} sites: {only_ids}")
+    if purge_stale:
+        log.info("purge_stale=True: 削除検知モードで実行 (全件取り直し)")
     start = time.time()
-    results = asyncio.run(crawl_all(only_site_ids=only_ids))
+    results = asyncio.run(crawl_all(only_site_ids=only_ids, purge_stale=purge_stale))
     elapsed = time.time() - start
     log.info(f"all done in {elapsed:.1f}s: {results}")
 

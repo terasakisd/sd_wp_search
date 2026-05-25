@@ -2,7 +2,8 @@ name: WordPress横断検索クローラ
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 0,6,12 * * *'   # 通常クロール: 09:00 / 15:00 / 21:00 JST (差分のみ)
+    - cron: '0 18 * * *'       # 削除検知: 03:00 JST (全件取り直し + DB側の孤児削除)
   workflow_dispatch:
     inputs:
       only_failed:
@@ -13,6 +14,10 @@ on:
         description: 'カンマ区切りのサイトID (空ならonly_failedの設定に従う)'
         type: string
         default: ''
+      purge_stale:
+        description: '削除検知モード (全件取り直し + 孤児削除)'
+        type: boolean
+        default: false
 
 # 履歴ファイルを commit するために必要
 permissions:
@@ -62,6 +67,8 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           # 優先順: 手入力 site_ids > only_failed の自動抽出 > 全件
           CRAWL_ONLY_SITE_IDS: ${{ inputs.site_ids != '' && inputs.site_ids || steps.failed.outputs.ids }}
+          # 削除検知モード: 手動指定 OR 03:00 JST (UTC18:00) の cron
+          CRAWL_PURGE_STALE: ${{ (inputs.purge_stale == true || github.event.schedule == '0 18 * * *') && '1' || '' }}
         run: python -m app.crawler
 
       - name: Supabase から現在件数を取得

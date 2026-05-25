@@ -203,6 +203,32 @@ def list_sites() -> list[sqlite3.Row]:
 
 # ----- 記事操作 ---------------------------------------------------------------
 
+def get_post_ids_for_site(site_id: str) -> set[int]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT post_id FROM posts WHERE site_id = ?", (site_id,)
+        ).fetchall()
+    return {r["post_id"] for r in rows}
+
+
+def delete_posts(site_id: str, post_ids: list[int]) -> int:
+    """指定IDの記事を削除。削除件数を返す。"""
+    if not post_ids:
+        return 0
+    with connect() as conn:
+        # SQLite の IN リテラルに大量IDを渡せないのでバッチ
+        deleted = 0
+        for i in range(0, len(post_ids), 500):
+            batch = post_ids[i:i + 500]
+            placeholders = ",".join("?" * len(batch))
+            cur = conn.execute(
+                f"DELETE FROM posts WHERE site_id = ? AND post_id IN ({placeholders})",
+                (site_id, *batch),
+            )
+            deleted += cur.rowcount
+    return deleted
+
+
 def upsert_post(post: dict[str, Any]) -> None:
     p = dict(post)
     p["title_idx"] = tokenize_for_index(p.get("title") or "")

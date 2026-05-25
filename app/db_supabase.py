@@ -167,6 +167,57 @@ def reset_all_modified_state() -> None:
 
 # ----- 記事操作 -------------------------------------------------------------
 
+def get_post_ids_for_site(site_id: str) -> set[int]:
+    """サイト内の全 post_id を取得。ページングしながら集計。"""
+    ids: set[int] = set()
+    page_size = 1000
+    offset = 0
+    while True:
+        r = _rest(
+            "GET", "/posts",
+            params={
+                "select": "post_id",
+                "site_id": f"eq.{site_id}",
+                "limit": page_size,
+                "offset": offset,
+            },
+        )
+        rows = r.json() or []
+        for row in rows:
+            pid = row.get("post_id")
+            if pid is not None:
+                ids.add(int(pid))
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    return ids
+
+
+def delete_posts(site_id: str, post_ids: list[int]) -> int:
+    """指定IDの記事を削除。削除件数を返す。"""
+    if not post_ids:
+        return 0
+    deleted = 0
+    # PostgREST の in.() 句に大量IDを渡せないのでバッチ分割
+    for i in range(0, len(post_ids), 200):
+        batch = post_ids[i:i + 200]
+        ids_str = ",".join(str(x) for x in batch)
+        r = _rest(
+            "DELETE", "/posts",
+            params={"site_id": f"eq.{site_id}", "post_id": f"in.({ids_str})"},
+            extra_headers={"Prefer": "count=exact"},
+        )
+        cr = r.headers.get("content-range", "")
+        if "/" in cr:
+            try:
+                deleted += int(cr.split("/")[-1])
+            except ValueError:
+                deleted += len(batch)
+        else:
+            deleted += len(batch)
+    return deleted
+
+
 def upsert_post(post: dict[str, Any]) -> None:
     p = dict(post)
     # PostgreSQL の生成カラム fts は送らない (送ると弾かれる)
