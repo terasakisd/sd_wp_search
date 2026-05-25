@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.wpsearch.crawl</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/macsazandaia/Downloads/wp-search/scripts/mac_crawl.sh</string>
+    </array>
+
+    <!-- JST 3:00 / 9:00 / 15:00 / 21:00 に起動 (GitHub Actions cron と同期) -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>3</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>9</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>15</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>21</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+
+    <!-- システム起動時に実行 (missed schedule のキャッチアップ) -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- 多重起動防止 -->
+    <key>AbandonProcessGroup</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/macsazandaia/Downloads/wp-search/logs/launchd.out</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/macsazandaia/Downloads/wp-search/logs/launchd.err</string>
+</dict>
+</plist>
