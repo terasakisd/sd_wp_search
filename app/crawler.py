@@ -363,6 +363,12 @@ async def crawl_site(
                 )
             log.info(f"[{site_id}] done: {count} posts (server reports {server_total})")
 
+            # ウィジット領域のテキストを取得 (サイト共通エリア)
+            widget_text = await _fetch_widget_text(client, base_url)
+            if _upsert_widget_post(site_id, site["name"], base_url, widget_text):
+                fetched_ids.add(-1)
+                log.info(f"[{site_id}] widget saved ({len(widget_text)} chars)")
+
             # purge_stale 成功時: 取得できなかった post を削除 (安全装置なし)
             # 全件取得 (last_modified is None) のときのみ
             if purge_stale and last_modified is None:
@@ -395,6 +401,59 @@ def _url_to_post_id(url: str) -> int:
     """URLから決定的な正整数 post_id を生成 (SQLiteのINTEGER範囲内)。"""
     h = hashlib.md5(url.encode("utf-8")).hexdigest()
     return int(h[:15], 16)  # 15桁hex ≈ 60bit
+
+
+async def _fetch_widget_text(client: httpx.AsyncClient, base_url: str) -> str:
+    """サイトのトップページから記事本文以外のテキスト (ウィジット領域) を抽出。
+
+    記事本文 (main/article/.entry-content/#content) を削除した残りを集める。
+    結果としてサイドバー・フッター・ヘッダー・関連リンクなどのウィジット系
+    要素のテキストが取れる。
+    """
+    try:
+        r = await client.get(base_url, follow_redirects=True)
+        if r.status_code != 200:
+            return ""
+        if "html" not in r.headers.get("content-type", "").lower():
+            return ""
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        # 記事本文系の要素を削除 (重複検索を避ける)
+        for sel in ["main", "article", ".entry-content", "#content",
+                    ".post-content", ".entry", "#main"]:
+            for el in soup.select(sel):
+                el.decompose()
+        text = soup.get_text(separator=" ", strip=True)
+        text = " ".join(text.split())
+        # ハードリミット (FTS インデックスを肥大化させないため)
+        if len(text) > 30000:
+            text = text[:30000]
+        return text
+    except Exception as e:
+        log.warning(f"widget fetch failed for {base_url}: {e}")
+        return ""
+
+
+def _upsert_widget_post(site_id: str, site_name: str, base_url: str, widget_text: str) -> bool:
+    """ウィジットテキストを post_id=-1 として保存。保存したら True を返す。"""
+    if not widget_text:
+        return False
+    now = datetime.now(timezone.utc).isoformat()
+    db.upsert_post({
+        "site_id": site_id,
+        "post_id": -1,   # ウィジット領域用の sentinel ID
+        "url": base_url,
+        "title": f"ウィジット ({site_name})",
+        "excerpt": widget_text[:200],
+        "content": widget_text,
+        "author": "",
+        "published_at": now,
+        "modified_at": now,
+        "categories": "",
+        "tags": "",
+    })
+    return True
 
 
 def _extract_dates(soup: BeautifulSoup) -> tuple[str | None, str | None]:
@@ -573,6 +632,12 @@ async def crawl_site_scrape(
         site_id, datetime.now(timezone.utc).isoformat(), newest_modified
     )
     log.info(f"[{site_id}] scrape done: {count} articles ({fetch_errors} errors)")
+
+    # ウィジット領域のテキストを取得 (サイト共通エリア)
+    widget_text = await _fetch_widget_text(client, base_url)
+    if _upsert_widget_post(site_id, site["name"], base_url, widget_text):
+        fetched_ids.add(-1)
+        log.info(f"[{site_id}] widget saved ({len(widget_text)} chars)")
 
     # purge_stale: アーカイブに無い旧記事を削除 (安全装置なし、消してもDBだけ)
     if purge_stale:
