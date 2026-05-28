@@ -143,7 +143,8 @@ AS $$
     SELECT s.id, s.name, s.group_id, s.url, COALESCE(c.cnt, 0)::BIGINT AS count
     FROM sites s
     LEFT JOIN (
-        SELECT site_id, COUNT(*) AS cnt FROM posts GROUP BY site_id
+        -- ウィジット領域 (post_id=-1) はカウントから除外
+        SELECT site_id, COUNT(*) AS cnt FROM posts WHERE post_id <> -1 GROUP BY site_id
     ) c ON c.site_id = s.id
     ORDER BY s.group_id, s.name;
 $$;
